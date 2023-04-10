@@ -1,0 +1,76 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Install & Build
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-action/configure-aws-credentials@v1
+        with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repo if missing
+        uses: byu-oit/github-action-create-ecr-repo-if-missing@v2
+        with:
+          DOCKER_REPO_NAME: ${{ github.event.repository.name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        uses: docker/build-push-action@v3
+        id: build-image
+        env:
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+            IMAGE_TAG: ${{ github.sha }}
+        with:
+            context: .
+            push: true
+            tags: ${{ env.ECR_REGISTRY }}/${{ github.event.repository.name }}:${{ env.IMAGE_TAG }}, ${{ env.ECR_REGISTRY }}/${{ github.event.repository.name }}:latest
+            file: ./Dockerfile.upx
+            cache-from: type=gha,scope=main
+            cache-to: type=gha,mode=max,scope=main
+          
+      - name: Create Lambda if not exists
+        run: |
+          aws lambda create-function \
+            --function-name=${{ vars.FUNCTION_NAME || github.event.repository.name }} \
+            --timeout=${{ vars.TIMEOUT || 20 }} \
+            --memory-size=${{ vars.MEMORY_SIZE || 2048 }} \
+            --package-type Image \
+            --code="ImageUri=${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:latest"  \
+            --role=${{ secrets.ROLE_ARN }} || true
+
+      - name: Update Lambda
+        run: |
+          aws lambda wait function-updated-v2 \
+            --function-name=${{ vars.FUNCTION_NAME || github.event.repository.name }}
+          aws lambda update-function-code \
+            --function-name=${{ vars.FUNCTION_NAME || github.event.repository.name }} \
+            --image-uri=${{ steps.login-ecr.outputs.registry }}/${{ github.event.repository.name }}:latest \
+            --publish
+          aws lambda wait function-updated-v2 \
+            --function-name=${{ vars.FUNCTION_NAME || github.event.repository.name  }}
+          aws lambda update-function-configuration \
+            --function-name=${{ vars.FUNCTION_NAME || github.event.repository.name }} \
+            --memory-size=${{ vars.MEMORY_SIZE || 2048}} \
+            --timeout=${{ vars.TIMEOUT || 20 }} \
+            --role=${{ secrets.ROLE_ARN }}
